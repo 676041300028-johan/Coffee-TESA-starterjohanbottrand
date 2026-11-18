@@ -1,63 +1,42 @@
-from dataclasses import dataclass
-from typing import List, Optional
 import numpy as np
-from coffee_math import CoffeeLot, BUYER_SPECS
+from typing import List
+from coffee_math import CoffeeLot, BuyerRoute
 
+def is_lot_eligible_for_route(
+    lot: CoffeeLot,
+    route: BuyerRoute,
+    error_buffer: float = 0.005
+) -> bool:
+    """
+    ตรวจสอบว่า Lot ผ่านสเปกของ Route หรือไม่ โดยเผื่อค่าคลาดเคลื่อน +/- 0.5% ของเซิร์ฟเวอร์
+    - g_true อาจสูงกว่าที่เห็น -> เช็ก lot.g * (1 + buffer) <= max_defect
+    - m_true อาจสูงกว่าที่เห็น -> เช็ก lot.m * (1 + buffer) <= max_moisture
+    - s_true อาจต่ำกว่าที่เห็น -> เช็ก lot.s * (1 - buffer) >= min_screen
+    """
+    if lot.bags <= 0 or route.quota <= 0:
+        return False
 
-@dataclass
-class BuyerOrder:
-    order_id: str
-    buyer_type: str
-    quota_bags: int
-    company_name: str = ""
-    max_moisture: Optional[float] = None
-    max_defect: Optional[float] = None
-    max_ratio: Optional[float] = None
-    hidden_ceiling_ratio: Optional[float] = None
+    worst_g = lot.g * (1.0 + error_buffer)
+    worst_m = lot.m * (1.0 + error_buffer)
+    worst_s = lot.s * (1.0 - error_buffer)
 
-    def __post_init__(self):
-        b_type = self.buyer_type.strip().upper()
-        self.buyer_type = "COMMERCIAL" if "COMM" in b_type else "INSTANT"
-        if not self.company_name:
-            self.company_name = self.order_id
+    if worst_g > route.max_defect:
+        return False
+    if worst_m > route.max_moisture:
+        return False
+    if route.min_screen > 0.0 and worst_s < route.min_screen:
+        return False
 
-        spec = BUYER_SPECS[self.buyer_type]
-        if self.max_moisture is None:
-            self.max_moisture = spec["max_moisture"]
-        if self.max_defect is None:
-            self.max_defect = spec["max_defect"]
-        if self.max_ratio is None:
-            self.max_ratio = spec["ratio_mid"]
+    return True
 
-
-def build_action_mask(
+def get_valid_route_mask(
     lots: List[CoffeeLot],
-    routes: List[BuyerOrder],
-    error_buffer: float = 0.005,
+    routes: List[BuyerRoute],
+    error_buffer: float = 0.005
 ) -> np.ndarray:
-    """
-    สร้าง Boolean Matrix (4 Lots x 8 Routes)
-    เผื่อ error_buffer = 0.005 (0.5%) ป้องกันกรณีค่าจริงของ s, m, g คลาดเคลื่อนจนข้ามเกรดและโดนตีตก
-    """
-    num_lots = len(lots)
-    num_routes = len(routes)
-    mask = np.zeros((num_lots, num_routes), dtype=bool)
-
+    """สร้าง Action Mask ขนาด (len(lots), len(routes))"""
+    mask = np.zeros((len(lots), len(routes)), dtype=bool)
     for i, lot in enumerate(lots):
-        if lot.bags <= 0:
-            continue
-
-        # คำนวณค่ากรณีเลวร้ายที่สุด (+0.5% error)
-        worst_m = lot.m * (1.0 + error_buffer)
-        worst_g = lot.g * (1.0 + error_buffer)
-
-        for j, order in enumerate(routes):
-            if order.quota_bags <= 0:
-                continue
-
-            if worst_m > order.max_moisture or worst_g > order.max_defect:
-                continue
-
-            mask[i, j] = True
-
+        for j, route in enumerate(routes):
+            mask[i, j] = is_lot_eligible_for_route(lot, route, error_buffer)
     return mask

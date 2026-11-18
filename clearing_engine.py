@@ -1,299 +1,214 @@
-import sys
-from pathlib import Path
-
-CURRENT_DIR = Path(__file__).resolve().parent
-if str(CURRENT_DIR) not in sys.path:
-    sys.path.insert(0, str(CURRENT_DIR))
-
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
-import numpy as np
-
-from coffee_math import CoffeeLot, BUYER_SPECS
-from action_mask import BuyerOrder
-from bag_router import BagOrderAction
-
-
-@dataclass
-class ClearingResult:
-    round_num: int
-    team_feedback: Dict[str, List[Dict]]
-    team_revenue: Dict[str, float]
-    team_profit_over_tv: Dict[str, float]
-    market_stats: Dict[str, float]
-
+import random
+import math
+from typing import List, Dict, Tuple
+from coffee_math import CoffeeLot, BuyerRoute, calculate_tv
 
 class BuyerCompanyPool:
-    COMPANIES = [
-        ("1 พรีเมียมโรสเตอร์", "COMMERCIAL", 7.0, 12.5),
-        ("2 โกลบอลคอฟฟี่", "COMMERCIAL", 7.0, 12.5),
-        ("3 สยามคอมเมิร์ซ", "COMMERCIAL", 7.0, 12.5),
-        ("4 ชุมพรคั่วบด", "COMMERCIAL", 7.0, 12.5),
-        ("5 บลูเมาท์เทน", "INSTANT", 15.0, 14.0),
-        ("6 ทรีอินวันฟู้ดส์", "INSTANT", 15.0, 14.0),
-        ("7 เอเชียอินสแตนท์", "INSTANT", 15.0, 14.0),
-        ("8 สยามเบฟเวอเรจ", "INSTANT", 15.0, 14.0),
-    ]
+    def __init__(self, seed: int = None):
+        self.rng = random.Random(seed)
+        # ฐานข้อมูลบริษัทผู้ซื้อทั้ง 3 กลุ่มตามสนามจริง
+        self.specialty_templates = [
+            {"name": "บางกอกบลูม", "min_s": 17.0, "max_g": 3.0, "max_m": 12.5, "ceil": 1.24, "base_q": 4},
+            {"name": "ดอยช้างโรสเตอร์", "min_s": 16.0, "max_g": 3.0, "max_m": 12.5, "ceil": 1.22, "base_q": 2},
+            {"name": "เชียงใหม่สเปเชียลตี้", "min_s": 17.0, "max_g": 2.5, "max_m": 12.0, "ceil": 1.25, "base_q": 3},
+        ]
+        self.commercial_templates = [
+            {"name": "สยามคอฟฟี่เทรด", "min_s": 0.0, "max_g": 3.0, "max_m": 12.5, "ceil": 1.04},
+            {"name": "ไทยโรสเตอร์กรุ๊ป", "min_s": 0.0, "max_g": 5.0, "max_m": 13.0, "ceil": 1.03},
+            {"name": "อาราบิก้าเอ็กซ์พอร์ต", "min_s": 15.0, "max_g": 4.0, "max_m": 12.5, "ceil": 1.035},
+            {"name": "บูรพาคอฟฟี่", "min_s": 0.0, "max_g": 6.0, "max_m": 13.5, "ceil": 1.025},
+        ]
+        self.instant_templates = [
+            {"name": "อินสแตนท์อินดัสทรี", "min_s": 0.0, "max_g": 10.0, "max_m": 14.5, "ceil": 0.985},
+            {"name": "โรงคั่วอุตสาหกรรม", "min_s": 0.0, "max_g": 12.0, "max_m": 15.0, "ceil": 0.975},
+            {"name": "แมสเบฟเวอเรจ", "min_s": 0.0, "max_g": 9.0, "max_m": 14.0, "ceil": 0.990},
+        ]
 
-    def __init__(self, rng: np.random.Generator, ceiling_mode: str = "FIXED"):
-        self.rng = rng
-        self.ceiling_mode = ceiling_mode
-        self.fixed_ceilings: Dict[str, float] = {
-            name: self._sample_ceiling(b_type)
-            for name, b_type, _, _ in self.COMPANIES
-        }
+    def get_event_demand_multiplier(self, round_idx: int, total_rounds: int, event_phase_offset: int = 0) -> float:
+        """
+        จำลอง Market Event Wave สำหรับเกม 16 รอบ (สลับช่วงละ 4 รอบติดกัน)
+        - ช่วงซบเซา (Bear Wave 4 รอบ): รับซื้อลดลง ~35% (ตัวคูณ 0.65)
+        - ช่วงบูม (Bull Wave 4 รอบ): รับซื้อเพิ่มขึ้น ~35% (ตัวคูณ 1.35)
+        """
+        if total_rounds < 16:
+            return 1.0  # โหมด 9 รอบ ตลาดปกติสม่ำเสมอ
 
-    def _sample_ceiling(self, buyer_type: str) -> float:
-        spec = BUYER_SPECS[buyer_type]
-        return round(
-            float(self.rng.uniform(spec["ratio_min"] - 0.003, spec["ratio_max"] + 0.003)),
-            4,
-        )
-
-    def plan_game_round_quotas(
-        self,
-        total_market_supply: int,
-        total_rounds: int = 7,
-        demand_ratio: float = 0.80,
-    ) -> List[int]:
-        total_game_quota = max(1, int(round(total_market_supply * demand_ratio)))
-        weights = self.rng.dirichlet(np.full(total_rounds, 4.0))
-        round_quotas = self.rng.multinomial(total_game_quota, weights)
-        return [int(q) for q in round_quotas]
+        block = ((round_idx - 1 + event_phase_offset) // 4) % 2
+        return 0.65 if block == 0 else 1.35
 
     def generate_round_routes(
         self,
-        round_total_quota: int,
-        comm_share: float = 0.45,
-    ) -> List[BuyerOrder]:
-        indices = self.rng.permutation(len(self.COMPANIES))
-        routes: List[BuyerOrder] = []
+        round_idx: int,
+        total_rounds: int,
+        total_market_bags: int,
+        event_phase_offset: int = 0
+    ) -> List[BuyerRoute]:
+        routes: List[BuyerRoute] = []
+        demand_mult = self.get_event_demand_multiplier(round_idx, total_rounds, event_phase_offset)
 
-        if round_total_quota <= 0:
-            quotas = np.zeros(len(indices), dtype=int)
-        else:
-            weights = []
-            for comp_idx in indices:
-                b_type = self.COMPANIES[comp_idx][1]
-                base_w = comm_share if b_type == "COMMERCIAL" else (1.0 - comm_share)
-                weights.append(base_w * float(self.rng.uniform(0.4, 1.6)))
-            probs = np.array(weights) / np.sum(weights)
-            quotas = self.rng.multinomial(round_total_quota, probs)
+        # เป้าหมายโควตารวมของตลาดในรอบนี้ (~80% ของสต็อกเฉลี่ยต่อรอบ * event multiplier)
+        avg_round_supply = (total_market_bags * 0.80) / max(1, total_rounds)
+        target_round_demand = max(20, int(round(avg_round_supply * demand_mult)))
 
-        for idx_pos, comp_idx in enumerate(indices):
-            name, b_type, max_def, max_moist = self.COMPANIES[comp_idx]
-            ceiling = (
-                self.fixed_ceilings[name]
-                if self.ceiling_mode == "FIXED"
-                else self._sample_ceiling(b_type)
-            )
-            routes.append(
-                BuyerOrder(
-                    order_id=f"rt{idx_pos + 1:02d}",
-                    buyer_type=b_type,
-                    quota_bags=int(quotas[idx_pos]),
-                    company_name=name,
-                    max_moisture=max_moist,
-                    max_defect=max_def,
-                    hidden_ceiling_ratio=ceiling,
-                )
-            )
+        # 1. สุ่มเปิด Route กลุ่ม SPECIALTY (0 ถึง 2 บริษัทต่อรอบ, โอกาสสูงขึ้นช่วงตลาดบูม)
+        spec_prob = 0.80 if demand_mult >= 1.0 else 0.45
+        num_spec = 0
+        if self.rng.random() < spec_prob:
+            num_spec = self.rng.choice([1, 2])
+
+        chosen_specs = self.rng.sample(self.specialty_templates, k=num_spec)
+        spec_quota_used = 0
+        for idx, tmpl in enumerate(chosen_specs):
+            # โควตาต่อทีมประมาณ 2-4 กระสอบ คูณจำนวนทีมแบบ scaled (สมมติ 55 ทีมแย่งกัน)
+            q = max(10, int(round(tmpl["base_q"] * 18 * demand_mult)))
+            spec_quota_used += q
+            routes.append(BuyerRoute(
+                route_id=f"R5-0{idx+1}",
+                company_name=tmpl["name"],
+                buyer_type="SPECIALTY",
+                quota=q,
+                max_defect=tmpl["max_g"],
+                max_moisture=tmpl["max_m"],
+                min_screen=tmpl["min_s"],
+                base_ceiling_mult=round(tmpl["ceil"] + self.rng.uniform(-0.005, 0.005), 4)
+            ))
+
+        # 2. กระจายโควตาที่เหลือให้ COMMERCIAL (65%) และ INSTANT (35%) รวมกันครบ 8 เส้นทาง
+        rem_demand = max(16, target_round_demand - spec_quota_used)
+        num_comm = 5 if num_spec <= 1 else 4
+        num_inst = 8 - num_spec - num_comm
+
+        comm_demand = int(rem_demand * 0.65)
+        inst_demand = rem_demand - comm_demand
+
+        for i in range(num_comm):
+            tmpl = self.commercial_templates[i % len(self.commercial_templates)]
+            q = max(4, comm_demand // num_comm)
+            routes.append(BuyerRoute(
+                route_id=f"R{i+1}-01",
+                company_name=tmpl["name"],
+                buyer_type="COMMERCIAL",
+                quota=q,
+                max_defect=tmpl["max_g"],
+                max_moisture=tmpl["max_m"],
+                min_screen=tmpl["min_s"],
+                base_ceiling_mult=round(tmpl["ceil"] + self.rng.uniform(-0.008, 0.008), 4)
+            ))
+
+        for i in range(num_inst):
+            tmpl = self.instant_templates[i % len(self.instant_templates)]
+            q = max(4, inst_demand // max(1, num_inst))
+            routes.append(BuyerRoute(
+                route_id=f"R{num_comm+i+1}-01",
+                company_name=tmpl["name"],
+                buyer_type="INSTANT",
+                quota=q,
+                max_defect=tmpl["max_g"],
+                max_moisture=tmpl["max_m"],
+                min_screen=tmpl["min_s"],
+                base_ceiling_mult=round(tmpl["ceil"] + self.rng.uniform(-0.008, 0.008), 4)
+            ))
+
         return routes
 
 
 class MarketClearingEngine:
-    def __init__(self, rng: Optional[np.random.Generator] = None):
-        self.rng = rng if rng is not None else np.random.default_rng()
+    def __init__(self, grade_error_std: float = 0.005):
+        self.grade_error_std = grade_error_std
 
-    def generate_team_lots(
-        self, team_id: str, total_bags_range: Tuple[int, int] = (24, 30)
-    ) -> List[CoffeeLot]:
-        """
-        สุ่มเมล็ดกาแฟ 4 Lots พร้อมจำลองความคลาดเคลื่อน ±0.5% ระหว่างค่าที่ผู้เล่นเห็น (s, m, g)
-        กับค่าจริงฝั่งเซิร์ฟเวอร์ (s_true, m_true, g_true)
-        """
-        target_total = int(
-            self.rng.integers(total_bags_range[0], total_bags_range[1] + 1)
-        )
-        splits = self.rng.multinomial(target_total - 12, [0.25, 0.25, 0.25, 0.25]) + 3
-        profiles = [
-            (
-                float(self.rng.integers(15, 18)),
-                round(float(self.rng.uniform(10.8, 12.2)), 2),
-                round(float(self.rng.uniform(0.5, 2.5)), 2),
-            ),
-            (
-                float(self.rng.integers(14, 17)),
-                round(float(self.rng.uniform(11.5, 12.55)), 2),  # มีโอกาสปริ่ม 12.5% และข้ามเกรด
-                round(float(self.rng.uniform(2.0, 7.05)), 2),    # มีโอกาสปริ่ม 7.0% และข้ามเกรด
-            ),
-            (
-                float(self.rng.integers(13, 16)),
-                round(float(self.rng.uniform(12.6, 13.8)), 2),
-                round(float(self.rng.uniform(3.0, 9.0)), 2),
-            ),
-            (
-                float(self.rng.integers(12, 15)),
-                round(float(self.rng.uniform(12.8, 14.05)), 2),
-                round(float(self.rng.uniform(6.0, 14.5)), 2),
-            ),
-        ]
-
-        lots: List[CoffeeLot] = []
-        for i in range(4):
-            s_true, m_true, g_true = profiles[i]
-            # สุ่ม error ±0.5% สำหรับค่าที่ผู้เล่นมองเห็น
-            s_obs = round(s_true * (1.0 + float(self.rng.uniform(-0.005, 0.005))), 2)
-            m_obs = round(m_true * (1.0 + float(self.rng.uniform(-0.005, 0.005))), 3)
-            g_obs = round(g_true * (1.0 + float(self.rng.uniform(-0.005, 0.005))), 3)
-
-            lots.append(
-                CoffeeLot(
-                    lot_id=f"LOT-{i+1}",
-                    s=s_obs,
-                    m=m_obs,
-                    g=g_obs,
-                    bags=int(splits[i]),
-                    s_true=s_true,
-                    m_true=m_true,
-                    g_true=g_true,
-                )
-            )
-        return lots
+    @staticmethod
+    def get_max_sell_per_round(initial_bags: int) -> int:
+        """กติกาใหม่: ขายได้สูงสุดไม่เกิน floor(initial_bags / 4) ต่อรอบ"""
+        return initial_bags // 4
 
     def clear_market(
         self,
-        round_num: int,
-        team_inventories: Dict[str, List[CoffeeLot]],
-        routes: List[BuyerOrder],
-        all_orders: List[BagOrderAction],
-        team_round_sell_caps: Optional[Dict[str, int]] = None,
-    ) -> ClearingResult:
+        all_bids: List[Dict],
+        routes: List[BuyerRoute],
+        team_initial_bags: Dict[str, int],
+        rng: random.Random
+    ) -> Tuple[List[Dict], Dict[str, float]]:
         """
-        ตัดสินผลตลาดโดยใช้ค่าจริง (m_true, g_true, TV_true)
-        และบังคับเพดานขายสูงสุดต่อรอบของแต่ละทีม (initial_bags / 6 * 1.5)
+        จับคู่คำสั่งซื้อขายตามกฎ Reverse Auction:
+        1. เช็กเพดานขายต่อรอบ initial_bags // 4 ของแต่ละทีม
+        2. จำลอง True Grade (+/- 0.5%) เพื่อตรวจสเปกจริงและคำนวณ True TV
+        3. ตัดคำสั่งที่ราคา > เพดานบริษัท หรือไม่ผ่านสเปกจริง
+        4. เรียงลำดับ Bid/TV จากต่ำไปสูง (ใครเสนอคุ้มค่าสุดได้ขายก่อน)
         """
-        route_map = {r.order_id: r for r in routes}
-        lot_lookup = {
-            (t_id, lot.lot_id): lot
-            for t_id, lots in team_inventories.items()
-            for lot in lots
-        }
-        team_feedback = {t_id: [] for t_id in team_inventories}
-        team_revenue = {t_id: 0.0 for t_id in team_inventories}
-        team_profit_over_tv = {t_id: 0.0 for t_id in team_inventories}
+        route_map = {r.route_id: r for r in routes}
+        route_rem_quota = {r.route_id: r.quota for r in routes}
+        team_sold_this_round = {tid: 0 for tid in team_initial_bags}
 
-        # ติดตามโควตาการขายที่เหลือในรอบนี้ของแต่ละทีม
-        team_cap_left = (
-            dict(team_round_sell_caps)
-            if team_round_sell_caps is not None
-            else {t_id: 999 for t_id in team_inventories}
-        )
+        valid_bids = []
+        results = []
 
-        valid_bids = {r.order_id: [] for r in routes}
-        all_passed_ratios = []
+        for bid in all_bids:
+            tid = bid["team_id"]
+            rid = bid["route_id"]
+            lot: CoffeeLot = bid["lot"]
+            qty = bid["qty"]
+            ask_price = bid["price"]
 
-        for order in all_orders:
-            t_id = order.team_id
-            route = route_map.get(order.rfq_id)
-            lot = lot_lookup.get((t_id, order.lot_id))
-            if route is None or lot is None or order.bags <= 0:
+            route = route_map.get(rid)
+            if not route or qty <= 0:
                 continue
 
-            # 1. ตรวจคุณภาพด้วยค่าจริงฝั่งเซิร์ฟเวอร์ (m_true, g_true)
-            if lot.m_true > route.max_moisture or lot.g_true > route.max_defect:
-                team_feedback[t_id].append({
-                    "rfq": order.rfq_id,
-                    "lot": order.lot_id,
-                    "price": order.bid_price,
-                    "bags_submitted": order.bags,
-                    "bags_sold": 0,
-                    "status": "ไม่ผ่านเกณฑ์คุณภาพ",
-                })
+            # บังคับเพดานขายสูงสุดต่อรอบ initial_bags // 4
+            max_cap = self.get_max_sell_per_round(team_initial_bags[tid])
+            allowed_qty = min(qty, max(0, max_cap - team_sold_this_round[tid]))
+            if allowed_qty <= 0:
+                results.append({**bid, "status": "CAP_EXCEEDED", "sold_qty": 0})
                 continue
 
-            # 2. คำนวณ Ratio ด้วยค่า TV_true จริงฝั่งเซิร์ฟเวอร์
-            true_tv = max(1e-6, lot.TV_true)
-            ratio_true = order.bid_price / true_tv
-            ceiling = (
-                route.hidden_ceiling_ratio
-                if route.hidden_ceiling_ratio is not None
-                else route.max_ratio
-            )
-            if ratio_true > ceiling + 1e-6:
-                team_feedback[t_id].append({
-                    "rfq": order.rfq_id,
-                    "lot": order.lot_id,
-                    "price": order.bid_price,
-                    "bags_submitted": order.bags,
-                    "bags_sold": 0,
-                    "status": "แพงเกินเพดานผู้ซื้อ",
-                })
+            # จำลองค่าจริงบนเซิร์ฟเวอร์ (คลาดเคลื่อน +/- 0.5%)
+            true_s = lot.s * (1.0 + rng.uniform(-self.grade_error_std, self.grade_error_std))
+            true_m = lot.m * (1.0 + rng.uniform(-self.grade_error_std, self.grade_error_std))
+            true_g = lot.g * (1.0 + rng.uniform(-self.grade_error_std, self.grade_error_std))
+            true_tv = calculate_tv(true_s, true_m, true_g)
+
+            # ตรวจสเปกจริง
+            if (true_g > route.max_defect or
+                true_m > route.max_moisture or
+                true_s < route.min_screen):
+                results.append({**bid, "status": "SPEC_FAILED", "sold_qty": 0})
                 continue
 
-            valid_bids[order.rfq_id].append((ratio_true, float(self.rng.random()), order))
+            # ตรวจเพดานราคาของบริษัท
+            ceiling_price = true_tv * route.base_ceiling_mult
+            if ask_price > ceiling_price:
+                results.append({**bid, "status": "CEILING_EXCEEDED", "sold_qty": 0})
+                continue
 
-        # 3. เรียงลำดับตาม Ratio จริง (ต่ำไปสูง) และตัดยอดทั้งโควตาผู้ซื้อ + เพดานขายต่อรอบของทีม
-        total_sold = 0
-        for r in routes:
-            rem_q = r.quota_bags
-            cands = sorted(valid_bids[r.order_id], key=lambda x: (x[0], x[1]))
-            for ratio_true, _, order in cands:
-                t_id = order.team_id
-                lot = lot_lookup[(t_id, order.lot_id)]
+            bid_tv_ratio = ask_price / max(1e-6, true_tv)
+            valid_bids.append({
+                **bid,
+                "allowed_qty": allowed_qty,
+                "true_tv": true_tv,
+                "bid_tv_ratio": bid_tv_ratio
+            })
 
-                # จำกัดการขายด้วย: ออเดอร์ที่ส่ง, ของในสต็อก, โควตาผู้ซื้อ, และเพดานขายต่อรอบของทีม
-                sold = min(order.bags, lot.bags, rem_q, team_cap_left[t_id])
+        # เรียงลำดับจากอัตราส่วน Price / True_TV ต่ำสุดไปสูงสุด
+        valid_bids.sort(key=lambda x: x["bid_tv_ratio"])
 
-                if sold <= 0:
-                    if team_cap_left[t_id] <= 0:
-                        status_str = "เต็มเพดานขายต่อรอบ"
-                    else:
-                        status_str = "ราคาแพ้ (โควตาเต็ม)"
-                elif sold < order.bags:
-                    status_str = "ขายได้บางส่วน"
-                else:
-                    status_str = "ขายได้ทั้งหมด"
+        for b in valid_bids:
+            tid = b["team_id"]
+            rid = b["route_id"]
+            max_cap = self.get_max_sell_per_round(team_initial_bags[tid])
+            cap_left = max(0, max_cap - team_sold_this_round[tid])
+            quota_left = route_rem_quota[rid]
 
-                if sold > 0:
-                    lot.bags -= sold
-                    rem_q -= sold
-                    team_cap_left[t_id] -= sold
-                    total_sold += sold
-                    team_revenue[t_id] += round(order.bid_price * sold, 2)
-                    team_profit_over_tv[t_id] += round((order.bid_price - lot.TV_true) * sold, 2)
-                    all_passed_ratios.append(ratio_true)
-
-                team_feedback[t_id].append({
-                    "rfq": order.rfq_id,
-                    "lot": order.lot_id,
-                    "price": order.bid_price,
-                    "bags_submitted": order.bags,
-                    "bags_sold": sold,
-                    "status": status_str,
+            fill_qty = min(b["allowed_qty"], cap_left, quota_left)
+            if fill_qty > 0:
+                team_sold_this_round[tid] += fill_qty
+                route_rem_quota[rid] -= fill_qty
+                status = "SOLD" if fill_qty == b["qty"] else "PARTIAL_SOLD"
+                results.append({
+                    **b,
+                    "status": status,
+                    "sold_qty": fill_qty,
+                    "revenue": fill_qty * b["price"]
                 })
+            else:
+                results.append({**b, "status": "QUOTA_FULL", "sold_qty": 0, "revenue": 0.0})
 
-        stats = {
-            "total_sold_bags": float(total_sold),
-            "avg_clearing_ratio": float(np.mean(all_passed_ratios)) if all_passed_ratios else 0.95,
-            "min_clearing_ratio": float(np.min(all_passed_ratios)) if all_passed_ratios else 0.90,
-            "max_clearing_ratio": float(np.max(all_passed_ratios)) if all_passed_ratios else 1.00,
-        }
-        return ClearingResult(
-            round_num, team_feedback, team_revenue, team_profit_over_tv, stats
-        )
-
-    def liquidate_remaining_inventory(
-        self, team_inventories: Dict[str, List[CoffeeLot]], liquidation_ratio: float = 0.80
-    ) -> Dict[str, Tuple[float, float]]:
-        results = {}
-        for t_id, lots in team_inventories.items():
-            liq_rev, liq_prof = 0.0, 0.0
-            for lot in lots:
-                if lot.bags > 0:
-                    fp = round(lot.TV_true * liquidation_ratio, 2)
-                    liq_rev += fp * lot.bags
-                    liq_prof += (fp - lot.TV_true) * lot.bags
-                    lot.bags = 0
-            results[t_id] = (round(liq_rev, 2), round(liq_prof, 2))
-        return results
+        return results, route_rem_quota
