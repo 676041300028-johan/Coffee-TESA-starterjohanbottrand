@@ -6,10 +6,9 @@ from coffee_math import CoffeeLot, BuyerRoute, calculate_tv
 class BuyerCompanyPool:
     def __init__(self, seed: int = None):
         self.rng = random.Random(seed)
-        # ฐานข้อมูลบริษัทผู้ซื้อทั้ง 3 กลุ่มตามสนามจริง
         self.specialty_templates = [
             {"name": "บางกอกบลูม", "min_s": 17.0, "max_g": 3.0, "max_m": 12.5, "ceil": 1.24, "base_q": 4},
-            {"name": "ดอยช้างโรสเตอร์", "min_s": 16.0, "max_g": 3.0, "max_m": 12.5, "ceil": 1.22, "base_q": 2},
+            {"name": "ดอยช้างโรสเตอร์", "min_s": 16.0, "max_g": 3.0, "max_m": 12.5, "ceil": 1.22, "base_q": 3},
             {"name": "เชียงใหม่สเปเชียลตี้", "min_s": 17.0, "max_g": 2.5, "max_m": 12.0, "ceil": 1.25, "base_q": 3},
         ]
         self.commercial_templates = [
@@ -24,17 +23,31 @@ class BuyerCompanyPool:
             {"name": "แมสเบฟเวอเรจ", "min_s": 0.0, "max_g": 9.0, "max_m": 14.0, "ceil": 0.990},
         ]
 
-    def get_event_demand_multiplier(self, round_idx: int, total_rounds: int, event_phase_offset: int = 0) -> float:
+    def get_round_event_profile(self, round_idx: int, total_rounds: int) -> Tuple[float, float, int]:
         """
-        จำลอง Market Event Wave สำหรับเกม 16 รอบ (สลับช่วงละ 4 รอบติดกัน)
-        - ช่วงซบเซา (Bear Wave 4 รอบ): รับซื้อลดลง ~35% (ตัวคูณ 0.65)
-        - ช่วงบูม (Bull Wave 4 รอบ): รับซื้อเพิ่มขึ้น ~35% (ตัวคูณ 1.35)
+        ตาราง Event ตามรอบการแข่งขัน:
+          - รอบ 1-5: ปกติ (demand_mult=1.0, spec_boost=1.0, phase_code=0)
+          - รอบ 6-8: Specialty รับเยอะขึ้น (demand_mult=1.15, spec_boost=2.4, phase_code=1)
+          - รอบ 9-12: ปกติ (demand_mult=1.0, spec_boost=1.0, phase_code=0)
+          - รอบ 13-14: ความต้องการรับซื้อต่ำ (demand_mult=0.55, spec_boost=0.6, phase_code=2)
+          - รอบ 15: รับซื้อต่ำมาก (demand_mult=0.28, spec_boost=0.3, phase_code=3)
+          - รอบ 16 (รอบสุดท้าย): รอบขยะ บังคับรับซื้อที่ 0.80 * TV (phase_code=4)
         """
         if total_rounds < 16:
-            return 1.0  # โหมด 9 รอบ ตลาดปกติสม่ำเสมอ
+            return 1.0, 1.0, 0
 
-        block = ((round_idx - 1 + event_phase_offset) // 4) % 2
-        return 0.65 if block == 0 else 1.35
+        if 1 <= round_idx <= 5:
+            return 1.00, 1.00, 0
+        elif 6 <= round_idx <= 8:
+            return 1.15, 2.40, 1
+        elif 9 <= round_idx <= 12:
+            return 1.00, 1.00, 0
+        elif 13 <= round_idx <= 14:
+            return 0.55, 0.60, 2
+        elif round_idx == 15:
+            return 0.28, 0.30, 3
+        else:
+            return 1.00, 0.00, 4
 
     def generate_round_routes(
         self,
@@ -43,24 +56,38 @@ class BuyerCompanyPool:
         total_market_bags: int,
         event_phase_offset: int = 0
     ) -> List[BuyerRoute]:
+        demand_mult, spec_boost, phase_code = self.get_round_event_profile(round_idx, total_rounds)
+
+        if total_rounds >= 16 and round_idx >= total_rounds:
+            return [
+                BuyerRoute(
+                    route_id="R16-CLEAR",
+                    company_name="ตลาดรับซื้อรอบปิดเกม (0.80)",
+                    buyer_type="INSTANT",
+                    quota=max(99999, total_market_bags),
+                    max_defect=100.0,
+                    max_moisture=100.0,
+                    min_screen=0.0,
+                    base_ceiling_mult=0.8000,
+                )
+            ]
+
         routes: List[BuyerRoute] = []
-        demand_mult = self.get_event_demand_multiplier(round_idx, total_rounds, event_phase_offset)
+        auction_rounds = 15 if total_rounds >= 16 else max(1, total_rounds)
+        avg_round_supply = (total_market_bags * 0.82) / auction_rounds
+        target_round_demand = max(25, int(round(avg_round_supply * demand_mult)))
 
-        # เป้าหมายโควตารวมของตลาดในรอบนี้ (~80% ของสต็อกเฉลี่ยต่อรอบ * event multiplier)
-        avg_round_supply = (total_market_bags * 0.80) / max(1, total_rounds)
-        target_round_demand = max(20, int(round(avg_round_supply * demand_mult)))
-
-        # 1. สุ่มเปิด Route กลุ่ม SPECIALTY (0 ถึง 2 บริษัทต่อรอบ, โอกาสสูงขึ้นช่วงตลาดบูม)
-        spec_prob = 0.80 if demand_mult >= 1.0 else 0.45
-        num_spec = 0
-        if self.rng.random() < spec_prob:
-            num_spec = self.rng.choice([1, 2])
+        if phase_code == 1:
+            num_spec = self.rng.choice([2, 3])
+        elif phase_code in (2, 3):
+            num_spec = 1 if self.rng.random() < 0.35 else 0
+        else:
+            num_spec = self.rng.choice([1, 2]) if self.rng.random() < 0.75 else 0
 
         chosen_specs = self.rng.sample(self.specialty_templates, k=num_spec)
         spec_quota_used = 0
         for idx, tmpl in enumerate(chosen_specs):
-            # โควตาต่อทีมประมาณ 2-4 กระสอบ คูณจำนวนทีมแบบ scaled (สมมติ 55 ทีมแย่งกัน)
-            q = max(10, int(round(tmpl["base_q"] * 18 * demand_mult)))
+            q = max(12, int(round(tmpl["base_q"] * 22 * spec_boost)))
             spec_quota_used += q
             routes.append(BuyerRoute(
                 route_id=f"R5-0{idx+1}",
@@ -73,17 +100,17 @@ class BuyerCompanyPool:
                 base_ceiling_mult=round(tmpl["ceil"] + self.rng.uniform(-0.005, 0.005), 4)
             ))
 
-        # 2. กระจายโควตาที่เหลือให้ COMMERCIAL (65%) และ INSTANT (35%) รวมกันครบ 8 เส้นทาง
-        rem_demand = max(16, target_round_demand - spec_quota_used)
-        num_comm = 5 if num_spec <= 1 else 4
-        num_inst = 8 - num_spec - num_comm
+        rem_demand = max(15, target_round_demand - spec_quota_used)
+        num_comm = max(2, 5 - num_spec)
+        num_inst = max(2, 8 - num_spec - num_comm)
 
-        comm_demand = int(rem_demand * 0.65)
-        inst_demand = rem_demand - comm_demand
+        comm_share = 0.45 if phase_code in (2, 3) else 0.65
+        comm_demand = int(rem_demand * comm_share)
+        inst_demand = max(6, rem_demand - comm_demand)
 
         for i in range(num_comm):
             tmpl = self.commercial_templates[i % len(self.commercial_templates)]
-            q = max(4, comm_demand // num_comm)
+            q = max(3, comm_demand // num_comm)
             routes.append(BuyerRoute(
                 route_id=f"R{i+1}-01",
                 company_name=tmpl["name"],
@@ -97,7 +124,7 @@ class BuyerCompanyPool:
 
         for i in range(num_inst):
             tmpl = self.instant_templates[i % len(self.instant_templates)]
-            q = max(4, inst_demand // max(1, num_inst))
+            q = max(3, inst_demand // num_inst)
             routes.append(BuyerRoute(
                 route_id=f"R{num_comm+i+1}-01",
                 company_name=tmpl["name"],
@@ -113,28 +140,24 @@ class BuyerCompanyPool:
 
 
 class MarketClearingEngine:
-    def __init__(self, grade_error_std: float = 0.005):
+    def __init__(self, grade_error_std: float = 0.005, cap_divisor: int = 5):
         self.grade_error_std = grade_error_std
+        self.cap_divisor = cap_divisor  # 4 = เพดาน 1/4, 5 = เพดาน 1/5 (เช่น 25 กระสอบ ขายได้ 5/รอบ)
 
-    @staticmethod
-    def get_max_sell_per_round(initial_bags: int) -> int:
-        """กติกาใหม่: ขายได้สูงสุดไม่เกิน floor(initial_bags / 4) ต่อรอบ"""
-        return initial_bags // 4
+    def get_max_sell_per_round(self, initial_bags: int, cap_divisor: int = None) -> int:
+        """กติกา: ขายได้สูงสุดไม่เกิน floor(initial_bags / cap_divisor) ต่อรอบ (รองรับทั้ง 1/4 และ 1/5)"""
+        div = cap_divisor if cap_divisor is not None else self.cap_divisor
+        return max(1, initial_bags // max(1, div))
 
     def clear_market(
         self,
         all_bids: List[Dict],
         routes: List[BuyerRoute],
         team_initial_bags: Dict[str, int],
-        rng: random.Random
+        rng: random.Random,
+        cap_divisor: int = None
     ) -> Tuple[List[Dict], Dict[str, float]]:
-        """
-        จับคู่คำสั่งซื้อขายตามกฎ Reverse Auction:
-        1. เช็กเพดานขายต่อรอบ initial_bags // 4 ของแต่ละทีม
-        2. จำลอง True Grade (+/- 0.5%) เพื่อตรวจสเปกจริงและคำนวณ True TV
-        3. ตัดคำสั่งที่ราคา > เพดานบริษัท หรือไม่ผ่านสเปกจริง
-        4. เรียงลำดับ Bid/TV จากต่ำไปสูง (ใครเสนอคุ้มค่าสุดได้ขายก่อน)
-        """
+        div = cap_divisor if cap_divisor is not None else self.cap_divisor
         route_map = {r.route_id: r for r in routes}
         route_rem_quota = {r.route_id: r.quota for r in routes}
         team_sold_this_round = {tid: 0 for tid in team_initial_bags}
@@ -153,29 +176,30 @@ class MarketClearingEngine:
             if not route or qty <= 0:
                 continue
 
-            # บังคับเพดานขายสูงสุดต่อรอบ initial_bags // 4
-            max_cap = self.get_max_sell_per_round(team_initial_bags[tid])
-            allowed_qty = min(qty, max(0, max_cap - team_sold_this_round[tid]))
-            if allowed_qty <= 0:
-                results.append({**bid, "status": "CAP_EXCEEDED", "sold_qty": 0})
-                continue
+            is_junk_round = (rid == "R16-CLEAR")
+            if is_junk_round:
+                allowed_qty = qty
+            else:
+                max_cap = self.get_max_sell_per_round(team_initial_bags[tid], div)
+                allowed_qty = min(qty, max(0, max_cap - team_sold_this_round[tid]))
+                if allowed_qty <= 0:
+                    results.append({**bid, "status": "CAP_EXCEEDED", "sold_qty": 0})
+                    continue
 
-            # จำลองค่าจริงบนเซิร์ฟเวอร์ (คลาดเคลื่อน +/- 0.5%)
             true_s = lot.s * (1.0 + rng.uniform(-self.grade_error_std, self.grade_error_std))
             true_m = lot.m * (1.0 + rng.uniform(-self.grade_error_std, self.grade_error_std))
             true_g = lot.g * (1.0 + rng.uniform(-self.grade_error_std, self.grade_error_std))
             true_tv = calculate_tv(true_s, true_m, true_g)
 
-            # ตรวจสเปกจริง
-            if (true_g > route.max_defect or
-                true_m > route.max_moisture or
-                true_s < route.min_screen):
-                results.append({**bid, "status": "SPEC_FAILED", "sold_qty": 0})
-                continue
+            if not is_junk_round:
+                if (true_g > route.max_defect or
+                    true_m > route.max_moisture or
+                    true_s < route.min_screen):
+                    results.append({**bid, "status": "SPEC_FAILED", "sold_qty": 0})
+                    continue
 
-            # ตรวจเพดานราคาของบริษัท
             ceiling_price = true_tv * route.base_ceiling_mult
-            if ask_price > ceiling_price:
+            if ask_price > ceiling_price + 1e-4:
                 results.append({**bid, "status": "CEILING_EXCEEDED", "sold_qty": 0})
                 continue
 
@@ -184,19 +208,22 @@ class MarketClearingEngine:
                 **bid,
                 "allowed_qty": allowed_qty,
                 "true_tv": true_tv,
-                "bid_tv_ratio": bid_tv_ratio
+                "bid_tv_ratio": bid_tv_ratio,
+                "is_junk_round": is_junk_round,
             })
 
-        # เรียงลำดับจากอัตราส่วน Price / True_TV ต่ำสุดไปสูงสุด
         valid_bids.sort(key=lambda x: x["bid_tv_ratio"])
 
         for b in valid_bids:
             tid = b["team_id"]
             rid = b["route_id"]
-            max_cap = self.get_max_sell_per_round(team_initial_bags[tid])
-            cap_left = max(0, max_cap - team_sold_this_round[tid])
-            quota_left = route_rem_quota[rid]
+            if b["is_junk_round"]:
+                cap_left = b["allowed_qty"]
+            else:
+                max_cap = self.get_max_sell_per_round(team_initial_bags[tid], div)
+                cap_left = max(0, max_cap - team_sold_this_round[tid])
 
+            quota_left = route_rem_quota[rid]
             fill_qty = min(b["allowed_qty"], cap_left, quota_left)
             if fill_qty > 0:
                 team_sold_this_round[tid] += fill_qty

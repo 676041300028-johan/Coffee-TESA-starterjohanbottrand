@@ -13,16 +13,20 @@ class BagCombinatorialRouter:
         routes: List[BuyerRoute],
         target_sell_bags: int,
         price_multiplier: float,
-        estimated_ceilings: Dict[str, float]
+        estimated_ceilings: Dict[str, float],
+        inst_price_multiplier: float = None
     ) -> List[Dict]:
         """
         จัดสรรกระสอบลงแต่ละ Route อย่างชาญฉลาด:
-        1. Priority #1: จับคู่ Lot เกรดพรีเมียม (s >= 17 หรือ s >= 16) เข้า SPECIALTY ก่อนเสมอ
-           เพื่อกวาดกำไร +22% ถึง +24% เหนือ TV
-        2. Priority #2: กระจายกระสอบที่เหลือตามสัดส่วนโควตาเข้า COMMERCIAL และ INSTANT
+        1. Priority #1: จับคู่ Lot เกรดพรีเมียมเข้า SPECIALTY ก่อนเสมอ
+        2. Priority #2: กระจายกระสอบที่เหลือเข้า COMMERCIAL (ใช้ price_multiplier)
+           และ INSTANT (ใช้ inst_price_multiplier เพื่อกดตัดราคาสู้ DUMPER ได้อิสระ)
         """
         if target_sell_bags <= 0 or not lots or not routes:
             return []
+
+        if inst_price_multiplier is None:
+            inst_price_multiplier = price_multiplier * 0.96
 
         valid_mask = get_valid_route_mask(lots, routes, self.error_buffer)
         rem_lot_bags = [lot.bags for lot in lots]
@@ -36,7 +40,6 @@ class BagCombinatorialRouter:
             j for j, r in enumerate(routes)
             if r.buyer_type == "SPECIALTY" and rem_route_quota[j] > 0
         ]
-        # เรียง Specialty ตามเพดานราคาจากสูงไปต่ำ (เช่น 1.24 ก่อน 1.22)
         spec_indices.sort(
             key=lambda j: estimated_ceilings.get(routes[j].route_id, routes[j].base_ceiling_mult),
             reverse=True
@@ -46,7 +49,6 @@ class BagCombinatorialRouter:
             if rem_to_sell <= 0:
                 break
             route = routes[j]
-            # หา Lot ที่ผ่านสเปกของ Specialty นี้ โดยเรียงจาก TV สูงสุด
             eligible_lots = [
                 i for i in range(len(lots))
                 if valid_mask[i, j] and rem_lot_bags[i] > 0
@@ -59,8 +61,7 @@ class BagCombinatorialRouter:
                 alloc = min(rem_lot_bags[i], rem_route_quota[j], rem_to_sell)
                 if alloc > 0:
                     ceil_mult = estimated_ceilings.get(route.route_id, route.base_ceiling_mult)
-                    # ตั้งราคาเกาะใต้เพดาน Specialty เล็กน้อย (เช่น 1.215 - 1.235)
-                    bid_mult = min(ceil_mult - 0.004, max(1.18, price_multiplier * 1.18))
+                    bid_mult = min(ceil_mult - 0.004, max(1.14, price_multiplier * 1.18))
                     orders.append({
                         "lot_id": lots[i].lot_id,
                         "lot": lots[i],
@@ -78,12 +79,10 @@ class BagCombinatorialRouter:
             j for j, r in enumerate(routes)
             if r.buyer_type != "SPECIALTY" and rem_route_quota[j] > 0
         ]
-        # ให้ความสำคัญ COMMERCIAL ก่อน INSTANT
         non_spec_indices.sort(
             key=lambda j: (0 if routes[j].buyer_type == "COMMERCIAL" else 1, -routes[j].quota)
         )
 
-        # วนกระจายทีละ 1-2 กระสอบ (Quota-Proportional) เพื่อลดความเสี่ยงกระจุกตัว
         while rem_to_sell > 0:
             progressed = False
             for j in non_spec_indices:
@@ -97,7 +96,6 @@ class BagCombinatorialRouter:
                 if not eligible_lots:
                     continue
 
-                # เลือก Lot ที่ TV ต่ำสุดก่อนสำหรับ Instant และกลางๆ สำหรับ Commercial
                 if route.buyer_type == "INSTANT":
                     eligible_lots.sort(key=lambda i: lots[i].tv)
                 else:
@@ -107,11 +105,9 @@ class BagCombinatorialRouter:
                 step_qty = min(2, rem_lot_bags[i], rem_route_quota[j], rem_to_sell)
                 if step_qty > 0:
                     ceil_mult = estimated_ceilings.get(route.route_id, route.base_ceiling_mult)
-                    # ปรับตัวคูณตาม Action ของ AI แต่ไม่ให้ทะลุเพดานทำนาย
-                    raw_mult = price_multiplier if route.buyer_type == "COMMERCIAL" else price_multiplier * 0.96
-                    safe_mult = min(ceil_mult - 0.003, max(0.85, raw_mult))
+                    raw_mult = price_multiplier if route.buyer_type == "COMMERCIAL" else inst_price_multiplier
+                    safe_mult = min(ceil_mult - 0.003, max(0.82, raw_mult))
 
-                    # รวมออเดอร์ถ้าซ้ำ (lot_id, route_id)
                     existing = next(
                         (o for o in orders if o["lot_id"] == lots[i].lot_id and o["route_id"] == route.route_id),
                         None
